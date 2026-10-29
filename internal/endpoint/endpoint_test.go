@@ -115,6 +115,40 @@ func TestEjectionLifecycle(t *testing.T) {
 	}
 }
 
+func TestDecay(t *testing.T) {
+	const period = 10 * time.Second
+	s := NewState()
+	s.Decay(epoch, period) // never ejected: nothing to do
+	if s.TimesEjected() != 0 {
+		t.Fatal("decayed a fresh state")
+	}
+	for range 3 {
+		s.Eject(epoch, time.Second, time.Hour, "x") // multiplier 3, ends at epoch+3s
+	}
+	end := epoch.Add(3 * time.Second)
+	s.Decay(end.Add(period-time.Nanosecond), period)
+	if s.TimesEjected() != 3 {
+		t.Fatalf("partial period decayed: %d", s.TimesEjected())
+	}
+	s.Decay(end.Add(period), period)
+	if s.TimesEjected() != 2 {
+		t.Fatalf("one period: %d", s.TimesEjected())
+	}
+	// The unused remainder of a period still counts at the next call.
+	s.Decay(end.Add(2*period+period/2), period)
+	if s.TimesEjected() != 1 {
+		t.Fatalf("two periods: %d", s.TimesEjected())
+	}
+	s.Decay(end.Add(3*period), period)
+	if s.TimesEjected() != 0 {
+		t.Fatalf("three periods: %d", s.TimesEjected())
+	}
+	s.Decay(end.Add(100*period), period) // never below zero
+	if s.TimesEjected() != 0 {
+		t.Fatalf("went negative: %d", s.TimesEjected())
+	}
+}
+
 func TestIntervalCounters(t *testing.T) {
 	s := NewState()
 	s.RecordResult(false, false)
