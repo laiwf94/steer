@@ -9,10 +9,10 @@ rather than piling it onto the last few hosts. A reload shouldn't throw away
 what steer has learned about each endpoint, and every size, count and time is
 bounded; the limits are all in [one table](#limits).
 
-This version leaves out TLS termination (put steer behind a TLS terminator or
-add `ServeTLS`; nothing in the design depends on plaintext), HTTP/2 to
-upstreams, service discovery other than the configuration file, and sharing
-state between steer instances. The last two are discussed under
+This version terminates TLS on the proxy listener (see
+[TLS termination](#tls-termination)) but leaves out HTTP/2 to upstreams,
+service discovery other than the configuration file, and sharing state
+between steer instances. The last two are discussed under
 [Running more than one instance](#running-more-than-one-instance).
 
 ## The request path
@@ -288,6 +288,50 @@ connections, while requests that do arrive are still served. After
 `STEER_DRAIN_PERIOD` the listeners close and in-flight requests have
 `STEER_SHUTDOWN_TIMEOUT` to finish; connections still open then are cut.
 
+## TLS termination
+
+With a `tls` block, the proxy listener terminates TLS 1.2 and 1.3
+(`internal/tlsedge`). The certificates and policy are loaded into an
+immutable snapshot published through an atomic pointer, the same pattern as
+the runtime. Every handshake reads the snapshot once, through
+`tls.Config.GetConfigForClient`, so a reload changes what new handshakes get
+and nothing else: connections that already finished their handshake keep
+the certificate and keys they negotiated and carry on serving. A reload
+re-reads every certificate and key file; if one is missing, unreadable or
+does not match its key, the whole reload is refused and the old certificates
+keep serving. TLS cannot be switched on or off by a reload, since that
+changes what the listener is.
+
+Certificates are chosen by SNI. Each certificate is selected for the DNS
+names in its SANs, or for `server_names` when given. An exact name beats a
+wildcard, and `*.example.com` covers exactly one label, `a.example.com` but
+neither `a.b.example.com` nor `example.com`, the rule RFC 6125 sets for
+clients; the server should not offer a certificate the client will reject.
+Names are compared lower-case with one trailing dot dropped. When several
+certificates carry a name, say an ECDSA and an RSA one, the first that the
+client's signature algorithms and cipher suites can use is chosen, as with
+NGINX's and HAProxy's dual certificates. A name that matches nothing, or no
+SNI at all, gets the first certificate; with `strict_sni` the handshake is
+refused instead, which keeps scanners that connect by IP address from
+learning which names the listener serves. Selection is a map lookup: 42 ns
+and no allocations with 400 names loaded.
+
+The `modern` cipher policy (the default) allows only ECDHE key exchange with
+AES-GCM or ChaCha20-Poly1305 in TLS 1.2; `compatible` adds the ECDHE AES-CBC
+suites for older clients. `cipher_suites` names the suites explicitly
+instead, and only suites that Go's TLS package considers secure are
+accepted. TLS 1.3 suites are not configurable. ALPN offers only `http/1.1`.
+
+Handshakes run in their own goroutines, not in the accept loop and not in
+the HTTP server's connection goroutine, so a client that connects and then
+stalls holds up no one. Each handshake has `handshake_timeout` as a hard
+deadline on the socket, cleared once it succeeds, after which the HTTP
+server's header and idle timeouts take over. At most
+`max_concurrent_handshakes` run at once; beyond that the accept loop waits
+and new connections queue in the kernel's listen backlog, not in steer's
+memory. A full ECDSA P-256 handshake over loopback costs about 1.3 ms of CPU
+for client and server together.
+
 ## What clients see when things break
 
 | Failure | What steer does | What the client sees |
@@ -322,6 +366,9 @@ connections, while requests that do arrive are still served. After
 | Upstream response headers | 64 KiB | Transport limit. |
 | Request ID | 128 characters of `A-Z a-z 0-9 . _ : -` | Safe to log and forward. |
 | Admin token | at least 16 characters | |
+| TLS certificates / names per certificate | 256 / 100 | Bounds memory and reload time. |
+| TLS handshake timeout | 5 s default, 100 ms-1 m | A stalled client holds a goroutine and a socket only this long. |
+| Concurrent TLS handshakes | 1,024 default, up to 100,000 | Bounds handshake CPU and memory under a connection flood. |
 
 Request bodies are streamed, not limited: a proxy in front of an upload
 service must not cap uploads. Put a limit in the upstream or a dedicated
@@ -341,6 +388,13 @@ are errors. Missing fields take the default shown.
 | `listen` | required | `host:port`, host an IP, `localhost` or empty |
 | `admin_listen` | `127.0.0.1:9901` | as above; non-loopback needs `STEER_ADMIN_TOKEN` |
 | `trusted_proxies` | none | up to 64 IPs or CIDRs |
+| `tls.certificates[]` | | `cert_file` and `key_file` (PEM; relative paths are relative to the configuration file), optional `server_names` (names or `*.suffix`) |
+| `tls.min_version` | `1.2` | `1.2` or `1.3` |
+| `tls.cipher_policy` | `modern` | `modern` or `compatible`; not with `cipher_suites` or TLS 1.3 only |
+| `tls.cipher_suites` | | Go names of secure TLS 1.2 suites, in preference order |
+| `tls.handshake_timeout` | 5s | 100ms-1m |
+| `tls.max_concurrent_handshakes` | 1024 | 1-100,000 |
+| `tls.strict_sni` | false | refuse handshakes whose name matches no certificate |
 | `routes[].host` | `*` | `*`, `name`, `*.suffix` |
 | `routes[].path_prefix` | `/` | clean absolute path, up to 1,024 characters |
 | `routes[].cluster` | required | an existing cluster |
@@ -371,7 +425,7 @@ are errors. Missing fields take the default shown.
 | `retry.budget.ratio` / `min_per_second` / `window` | 0.2 / 10 / 10s | 0-1 / 0-100,000 / whole seconds, 1s-1m |
 
 Omitting `health_check`, `outlier_detection` or `retry` turns that feature off
-for the cluster.
+for the cluster. Omitting `tls` serves plain HTTP.
 
 ## Security
 
@@ -422,7 +476,7 @@ weight endpoints or regions, and adding a locality to endpoints would let
 steer prefer its own zone and spill over with the same health-weighted math
 the priority levels use.
 
-Finally, TLS termination and HTTP/2 or HTTP/3 towards clients, with pooled
+Finally, HTTP/2 or HTTP/3 towards clients, with pooled
 HTTP/2 connections to upstreams. Retries, budgets and outlier detection work
 per request, so none of that changes.
 

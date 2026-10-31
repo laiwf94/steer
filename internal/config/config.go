@@ -8,6 +8,7 @@ package config
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"net/netip"
 	"net/textproto"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +36,12 @@ const (
 	MaxRetryBodyBytes = 16 << 20
 	MaxPathPrefixLen  = 1024
 	maxErrors         = 20
+
+	MaxCertificates           = 256
+	MaxServerNamesPerCert     = 100
+	MaxHandshakeTimeout       = time.Minute
+	MinHandshakeTimeout       = 100 * time.Millisecond
+	MaxConcurrentHandshakeCap = 100_000
 )
 
 // Defaults applied when a field is absent.
@@ -65,6 +73,9 @@ const (
 	DefaultBudgetRatio     = 0.2
 	DefaultBudgetMinPerSec = 10
 	DefaultBudgetWindow    = 10 * time.Second
+
+	DefaultHandshakeTimeout        = 5 * time.Second
+	DefaultMaxConcurrentHandshakes = 1024
 )
 
 // DefaultRetryOn is the set of upstream statuses retried when retry_on is absent.
@@ -85,8 +96,55 @@ type Config struct {
 	Listen         string
 	AdminListen    string
 	TrustedProxies []netip.Prefix
+	TLS            *TLS // nil serves plain HTTP
 	Routes         []Route
 	Clusters       []Cluster
+}
+
+// Cipher policies for TLS 1.2. TLS 1.3 suites are fixed by the protocol
+// implementation and are always all enabled.
+const (
+	CipherModern     = "modern"     // ECDHE with AES-GCM or ChaCha20-Poly1305 only
+	CipherCompatible = "compatible" // modern plus ECDHE with AES-CBC, for older clients
+)
+
+// TLS configures TLS termination on the proxy listener.
+type TLS struct {
+	Certificates []Certificate
+	MinVersion   uint16 // tls.VersionTLS12 or tls.VersionTLS13
+	// CipherSuites are the TLS 1.2 suites in preference order; nil when
+	// MinVersion is TLS 1.3.
+	CipherSuites            []uint16
+	HandshakeTimeout        time.Duration
+	MaxConcurrentHandshakes int
+	// StrictSNI refuses handshakes whose server name matches no certificate
+	// (and handshakes without one) instead of answering with the first
+	// certificate.
+	StrictSNI bool
+}
+
+// Certificate is a PEM certificate chain and its private key. ServerNames
+// overrides the names taken from the certificate's DNS SANs.
+type Certificate struct {
+	CertFile    string
+	KeyFile     string
+	ServerNames []string // lower-case names or *.suffix wildcards
+}
+
+// cipherPolicies lists the TLS 1.2 suites of each policy, in preference order.
+var cipherPolicies = map[string][]uint16{
+	CipherModern: {
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+	},
+	CipherCompatible: {
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA, tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+	},
 }
 
 // Route sends requests for Host whose path starts with PathPrefix to Cluster.
@@ -181,8 +239,25 @@ type rawConfig struct {
 	Listen         string       `json:"listen"`
 	AdminListen    string       `json:"admin_listen"`
 	TrustedProxies []string     `json:"trusted_proxies"`
+	TLS            *rawTLS      `json:"tls"`
 	Routes         []rawRoute   `json:"routes"`
 	Clusters       []rawCluster `json:"clusters"`
+}
+
+type rawTLS struct {
+	Certificates            []rawCertificate `json:"certificates"`
+	MinVersion              string           `json:"min_version"`
+	CipherPolicy            string           `json:"cipher_policy"`
+	CipherSuites            []string         `json:"cipher_suites"`
+	HandshakeTimeout        *Duration        `json:"handshake_timeout"`
+	MaxConcurrentHandshakes *int             `json:"max_concurrent_handshakes"`
+	StrictSNI               bool             `json:"strict_sni"`
+}
+
+type rawCertificate struct {
+	CertFile    string   `json:"cert_file"`
+	KeyFile     string   `json:"key_file"`
+	ServerNames []string `json:"server_names"`
 }
 
 type rawRoute struct {
@@ -248,7 +323,8 @@ type rawBudget struct {
 	Window       *Duration `json:"window"`
 }
 
-// Load reads and parses the file at path.
+// Load reads and parses the file at path. Relative certificate and key paths
+// are resolved against the directory that holds the file.
 func Load(path string) (*Config, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -262,7 +338,22 @@ func Load(path string) (*Config, error) {
 	if len(data) > MaxFileBytes {
 		return nil, fmt.Errorf("%s is larger than %d bytes", path, MaxFileBytes)
 	}
-	return Parse(data)
+	cfg, err := Parse(data)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.TLS != nil {
+		dir := filepath.Dir(path)
+		for i := range cfg.TLS.Certificates {
+			c := &cfg.TLS.Certificates[i]
+			for _, f := range []*string{&c.CertFile, &c.KeyFile} {
+				if !filepath.IsAbs(*f) {
+					*f = filepath.Join(dir, *f)
+				}
+			}
+		}
+	}
+	return cfg, nil
 }
 
 // Parse decodes and validates a configuration.
@@ -358,6 +449,9 @@ func (v *validator) config(raw *rawConfig) *Config {
 		}
 		cfg.TrustedProxies = append(cfg.TrustedProxies, p)
 	}
+	if raw.TLS != nil {
+		cfg.TLS = v.tls("tls", raw.TLS)
+	}
 
 	names := map[string]bool{}
 	if len(raw.Clusters) == 0 {
@@ -409,6 +503,112 @@ func (v *validator) config(raw *rawConfig) *Config {
 		cfg.Routes = append(cfg.Routes, r)
 	}
 	return cfg
+}
+
+func (v *validator) tls(path string, rt *rawTLS) *TLS {
+	t := &TLS{StrictSNI: rt.StrictSNI}
+	switch rt.MinVersion {
+	case "", "1.2":
+		t.MinVersion = tls.VersionTLS12
+	case "1.3":
+		t.MinVersion = tls.VersionTLS13
+	default:
+		v.add(path+".min_version", `must be "1.2" or "1.3"`)
+	}
+	switch {
+	case rt.CipherPolicy != "" && rt.CipherSuites != nil:
+		v.add(path+".cipher_suites", "cannot be combined with cipher_policy")
+	case rt.CipherSuites != nil:
+		t.CipherSuites = v.cipherSuites(path+".cipher_suites", rt.CipherSuites)
+	default:
+		policy := rt.CipherPolicy
+		if policy == "" {
+			policy = CipherModern
+		}
+		suites, ok := cipherPolicies[policy]
+		if !ok {
+			v.add(path+".cipher_policy", "must be %q or %q", CipherModern, CipherCompatible)
+		}
+		t.CipherSuites = append([]uint16(nil), suites...)
+	}
+	if t.MinVersion == tls.VersionTLS13 {
+		if rt.CipherPolicy != "" || rt.CipherSuites != nil {
+			v.add(path+".min_version", "TLS 1.3 suites are not configurable; drop cipher_policy and cipher_suites")
+		}
+		t.CipherSuites = nil
+	}
+	t.HandshakeTimeout = v.durIn(path+".handshake_timeout", rt.HandshakeTimeout, DefaultHandshakeTimeout, MinHandshakeTimeout, MaxHandshakeTimeout)
+	t.MaxConcurrentHandshakes = v.intIn(path+".max_concurrent_handshakes", rt.MaxConcurrentHandshakes, DefaultMaxConcurrentHandshakes, 1, MaxConcurrentHandshakeCap)
+
+	if len(rt.Certificates) == 0 {
+		v.add(path+".certificates", "at least one certificate is required")
+	}
+	if len(rt.Certificates) > MaxCertificates {
+		v.add(path+".certificates", "at most %d certificates", MaxCertificates)
+	}
+	for i, rc := range rt.Certificates {
+		cp := fmt.Sprintf("%s.certificates[%d]", path, i)
+		c := Certificate{CertFile: rc.CertFile, KeyFile: rc.KeyFile}
+		if c.CertFile == "" {
+			v.add(cp+".cert_file", "is required")
+		}
+		if c.KeyFile == "" {
+			v.add(cp+".key_file", "is required")
+		}
+		if rc.ServerNames != nil && len(rc.ServerNames) == 0 {
+			v.add(cp+".server_names", "must not be empty; omit it to use the certificate's names")
+		}
+		if len(rc.ServerNames) > MaxServerNamesPerCert {
+			v.add(cp+".server_names", "at most %d names", MaxServerNamesPerCert)
+		}
+		for j, n := range rc.ServerNames {
+			n = strings.ToLower(n)
+			if n == "*" || checkHostPattern(n) != nil {
+				v.add(fmt.Sprintf("%s.server_names[%d]", cp, j), "%q must be a host name or *.suffix", n)
+				continue
+			}
+			c.ServerNames = append(c.ServerNames, n)
+		}
+		t.Certificates = append(t.Certificates, c)
+	}
+	return t
+}
+
+func (v *validator) cipherSuites(path string, names []string) []uint16 {
+	if len(names) == 0 {
+		v.add(path, "must not be empty")
+		return nil
+	}
+	byName := map[string]*tls.CipherSuite{}
+	for _, cs := range tls.CipherSuites() {
+		byName[cs.Name] = cs
+	}
+	var ids []uint16
+	seen := map[uint16]bool{}
+	for i, n := range names {
+		cs := byName[n]
+		switch {
+		case cs == nil:
+			v.add(fmt.Sprintf("%s[%d]", path, i), "%q is not a supported secure cipher suite", n)
+		case !supportsTLS12(cs):
+			v.add(fmt.Sprintf("%s[%d]", path, i), "%q is a TLS 1.3 suite; those are always enabled", n)
+		case seen[cs.ID]:
+			v.add(fmt.Sprintf("%s[%d]", path, i), "duplicate cipher suite %q", n)
+		default:
+			seen[cs.ID] = true
+			ids = append(ids, cs.ID)
+		}
+	}
+	return ids
+}
+
+func supportsTLS12(cs *tls.CipherSuite) bool {
+	for _, ver := range cs.SupportedVersions {
+		if ver == tls.VersionTLS12 {
+			return true
+		}
+	}
+	return false
 }
 
 func (v *validator) cluster(path string, rc *rawCluster) Cluster {

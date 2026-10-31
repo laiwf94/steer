@@ -9,8 +9,10 @@
 //	STEER_SHUTDOWN_TIMEOUT  how long in-flight requests get to finish after that (default 30s)
 //	STEER_LOG_LEVEL         debug, info, warn or error (default info)
 //
+// With a "tls" block in the configuration the proxy listener terminates TLS.
+//
 // SIGHUP, or POST /reload on the admin listener, re-reads the configuration
-// file. SIGTERM or SIGINT drains: /readyz turns 503 so upstream load balancers
+// file, including certificates and keys. SIGTERM or SIGINT drains: /readyz turns 503 so upstream load balancers
 // stop sending traffic, keep-alive is switched off, and after the drain period
 // the listeners close and in-flight requests are given time to finish.
 package main
@@ -35,6 +37,7 @@ import (
 	"github.com/laiwf94/steer/internal/config"
 	"github.com/laiwf94/steer/internal/metrics"
 	"github.com/laiwf94/steer/internal/proxy"
+	"github.com/laiwf94/steer/internal/tlsedge"
 )
 
 func main() {
@@ -110,6 +113,19 @@ func loadConfig(s settings) (*config.Config, error) {
 	return cfg, nil
 }
 
+// loadTLS reads cfg's certificates and logs anything about them that will
+// not stop them serving but needs an operator's attention.
+func loadTLS(cfg *config.Config, log *slog.Logger) (*tlsedge.Snapshot, error) {
+	snap, err := tlsedge.Load(cfg.TLS)
+	if err != nil {
+		return nil, err
+	}
+	for _, w := range snap.Warnings(time.Now()) {
+		log.Warn("tls certificate", "problem", w)
+	}
+	return snap, nil
+}
+
 // run serves until ctx ends, then drains and shuts down. hup delivers reload
 // requests. ready, when set, receives the bound proxy and admin addresses.
 func run(ctx context.Context, getenv func(string) string, logOut io.Writer, hup <-chan os.Signal, ready func(proxyAddr, adminAddr string)) error {
@@ -123,6 +139,14 @@ func run(ctx context.Context, getenv func(string) string, logOut io.Writer, hup 
 		return err
 	}
 	reg := metrics.New()
+	var tlsStore *tlsedge.Store
+	if cfg.TLS != nil {
+		snap, err := loadTLS(cfg, log)
+		if err != nil {
+			return err
+		}
+		tlsStore = tlsedge.NewStore(snap)
+	}
 	p, err := proxy.New(cfg, proxy.Options{Logger: log, Metrics: reg})
 	if err != nil {
 		return err
@@ -134,10 +158,19 @@ func run(ctx context.Context, getenv func(string) string, logOut io.Writer, hup 
 		reloadMu.Lock()
 		defer reloadMu.Unlock()
 		next, err := loadConfig(s)
+		var snap *tlsedge.Snapshot
+		if err == nil && (next.TLS == nil) != (tlsStore == nil) {
+			err = errors.New("tls cannot be turned on or off by a reload; restart steer")
+		}
+		if err == nil && next.TLS != nil {
+			snap, err = loadTLS(next, log)
+		}
 		if err != nil {
 			p.RecordFailedReload()
-		} else {
-			err = p.Reload(next)
+		} else if err = p.Reload(next); err == nil && snap != nil {
+			// Handshakes from now on use the new certificates; established
+			// connections keep the ones they negotiated.
+			tlsStore.Swap(snap)
 		}
 		if err != nil {
 			log.Warn("configuration rejected; the previous configuration keeps serving", "error", err.Error())
@@ -152,9 +185,26 @@ func run(ctx context.Context, getenv func(string) string, logOut io.Writer, hup 
 		return err
 	}
 
-	proxyLn, err := net.Listen("tcp", cfg.Listen)
+	var proxyLn net.Listener
+	proxyLn, err = net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return err
+	}
+	if tlsStore != nil {
+		results := map[string]*metrics.Counter{}
+		for _, r := range []string{tlsedge.ResultOK, tlsedge.ResultTimeout, tlsedge.ResultError} {
+			results[r] = reg.Counter("steer_tls_handshakes_total", `result="`+r+`"`, "TLS handshakes on the proxy listener by result.")
+		}
+		duration := reg.Histogram("steer_tls_handshake_duration_seconds", "", "Time to complete a TLS handshake on the proxy listener.")
+		tl := tlsedge.NewListener(proxyLn, tlsStore, func(result string, d time.Duration) {
+			results[result].Inc()
+			if result == tlsedge.ResultOK {
+				duration.Observe(d)
+			}
+		})
+		reg.Gauge("steer_tls_handshakes_in_progress", "TLS handshakes running on the proxy listener.", func() float64 { return float64(tl.InProgress()) })
+		defer tl.Wait()
+		proxyLn = tl
 	}
 	adminLn, err := net.Listen("tcp", cfg.AdminListen)
 	if err != nil {
@@ -180,7 +230,7 @@ func run(ctx context.Context, getenv func(string) string, logOut io.Writer, hup 
 		MaxHeaderBytes:    16 << 10,
 		ErrorLog:          errorLog,
 	}
-	log.Info("listening", "proxy", proxyLn.Addr().String(), "admin", adminLn.Addr().String(),
+	log.Info("listening", "proxy", proxyLn.Addr().String(), "tls", tlsStore != nil, "admin", adminLn.Addr().String(),
 		"admin_auth", s.adminToken != "", "clusters", len(cfg.Clusters), "routes", len(cfg.Routes))
 	if ready != nil {
 		ready(proxyLn.Addr().String(), adminLn.Addr().String())

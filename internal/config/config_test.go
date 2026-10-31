@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/tls"
 	"os"
 	"path/filepath"
 	"strings"
@@ -254,6 +255,8 @@ func TestHelpers(t *testing.T) {
 func FuzzParse(f *testing.F) {
 	f.Add([]byte(full))
 	f.Add([]byte(`{"listen":":80","routes":[{"cluster":"a"}],"clusters":[{"name":"a","endpoints":[{"address":"h:1"}]}]}`))
+	f.Add([]byte(`{"listen":":443","routes":[{"cluster":"a"}],"clusters":[{"name":"a","endpoints":[{"address":"h:1"}]}],
+		"tls":{"certificates":[{"cert_file":"a","key_file":"b","server_names":["*.a.com"]}],"cipher_suites":["TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"],"min_version":"1.2"}}`))
 	f.Add([]byte(`{"listen":":80","clusters":[{"name":"a","policy":"maglev","hash_header":"k","endpoints":[{"address":"1.2.3.4:5","weight":1000,"priority":7}]}]}`))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		c, err := Parse(data)
@@ -284,12 +287,132 @@ func FuzzParse(f *testing.F) {
 				t.Fatalf("outlier %+v", o)
 			}
 		}
+		if tc := c.TLS; tc != nil {
+			if len(tc.Certificates) == 0 || tc.HandshakeTimeout < MinHandshakeTimeout || tc.MaxConcurrentHandshakes < 1 ||
+				(tc.MinVersion == tls.VersionTLS13) != (tc.CipherSuites == nil) {
+				t.Fatalf("tls %+v", tc)
+			}
+			for _, cc := range tc.Certificates {
+				if cc.CertFile == "" || cc.KeyFile == "" || (cc.ServerNames != nil && len(cc.ServerNames) == 0) {
+					t.Fatalf("certificate %+v", cc)
+				}
+				for _, n := range cc.ServerNames {
+					if n != strings.ToLower(n) || n == "*" || checkHostPattern(n) != nil {
+						t.Fatalf("server name %q", n)
+					}
+				}
+			}
+		}
 		for _, r := range c.Routes {
 			if !names[r.Cluster] || !strings.HasPrefix(r.PathPrefix, "/") || r.Host == "" {
 				t.Fatalf("route %+v", r)
 			}
 		}
 	})
+}
+
+func TestTLS(t *testing.T) {
+	const pre = `{"listen":":443","routes":[{"cluster":"a"}],"clusters":[{"name":"a","endpoints":[{"address":"h:1"}]}],"tls":`
+	c, err := Parse([]byte(pre + `{"certificates":[{"cert_file":"a.crt","key_file":"a.key"}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc := c.TLS
+	if tc.MinVersion != tls.VersionTLS12 || tc.HandshakeTimeout != DefaultHandshakeTimeout ||
+		tc.MaxConcurrentHandshakes != DefaultMaxConcurrentHandshakes || tc.StrictSNI ||
+		len(tc.CipherSuites) != len(cipherPolicies[CipherModern]) || tc.Certificates[0].ServerNames != nil {
+		t.Fatalf("defaults %+v", tc)
+	}
+	for _, id := range tc.CipherSuites {
+		if strings.Contains(tls.CipherSuiteName(id), "CBC") {
+			t.Fatalf("modern policy has %s", tls.CipherSuiteName(id))
+		}
+	}
+
+	c, err = Parse([]byte(pre + `{"certificates":[{"cert_file":"/a.crt","key_file":"/a.key","server_names":["API.example.com","*.example.org"]}],
+		"min_version":"1.2","cipher_policy":"compatible","handshake_timeout":"2s","max_concurrent_handshakes":10,"strict_sni":true}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc = c.TLS
+	if len(tc.CipherSuites) != len(cipherPolicies[CipherCompatible]) || tc.HandshakeTimeout != 2*time.Second ||
+		tc.MaxConcurrentHandshakes != 10 || !tc.StrictSNI ||
+		strings.Join(tc.Certificates[0].ServerNames, ",") != "api.example.com,*.example.org" {
+		t.Fatalf("explicit %+v", tc)
+	}
+
+	c, err = Parse([]byte(pre + `{"certificates":[{"cert_file":"a","key_file":"b"}],"cipher_suites":["TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256","TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.TLS.CipherSuites; len(got) != 2 || got[0] != tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 {
+		t.Fatalf("suites %v", got)
+	}
+
+	c, err = Parse([]byte(pre + `{"certificates":[{"cert_file":"a","key_file":"b"}],"min_version":"1.3"}}`))
+	if err != nil || c.TLS.MinVersion != tls.VersionTLS13 || c.TLS.CipherSuites != nil {
+		t.Fatalf("1.3: %v %+v", err, c)
+	}
+
+	cert := `"certificates":[{"cert_file":"a","key_file":"b"}]`
+	cases := map[string]string{
+		`{}`:                                                                           "tls.certificates: at least one certificate",
+		`{"certificates":[{}]}`:                                                        "cert_file: is required",
+		`{"certificates":[{"cert_file":"a"}]}`:                                         "key_file: is required",
+		`{` + cert + `,"min_version":"1.1"}`:                                           "min_version",
+		`{` + cert + `,"cipher_policy":"weak"}`:                                        "cipher_policy",
+		`{` + cert + `,"cipher_suites":[]}`:                                            "cipher_suites: must not be empty",
+		`{` + cert + `,"cipher_suites":["x"]}`:                                         "not a supported secure cipher suite",
+		`{` + cert + `,"cipher_suites":["TLS_RSA_WITH_RC4_128_SHA"]}`:                  "not a supported secure",
+		`{` + cert + `,"cipher_suites":["TLS_RSA_WITH_AES_128_GCM_SHA256"]}`:           "not a supported secure",
+		`{` + cert + `,"cipher_suites":["TLS_AES_128_GCM_SHA256"]}`:                    "TLS 1.3 suite",
+		`{` + cert + `,"cipher_policy":"modern","cipher_suites":["x"]}`:                "cannot be combined",
+		`{` + cert + `,"min_version":"1.3","cipher_policy":"modern"}`:                  "not configurable",
+		`{` + cert + `,"handshake_timeout":"10ms"}`:                                    "handshake_timeout",
+		`{` + cert + `,"handshake_timeout":"2m"}`:                                      "handshake_timeout",
+		`{` + cert + `,"max_concurrent_handshakes":0}`:                                 "max_concurrent_handshakes",
+		`{"certificates":[{"cert_file":"a","key_file":"b","server_names":[]}]}`:        "must not be empty",
+		`{"certificates":[{"cert_file":"a","key_file":"b","server_names":["*"]}]}`:     "host name or *.suffix",
+		`{"certificates":[{"cert_file":"a","key_file":"b","server_names":["a:1"]}]}`:   "host name or *.suffix",
+		`{"certificates":[{"cert_file":"a","key_file":"b","server_names":["*.*.a"]}]}`: "host name or *.suffix",
+		`{"certificates":[{"cert_file":"a","key_file":"b"}],"cipher_suites":["TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256","TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"]}`: "duplicate cipher suite",
+		`{"certificates":[{"cert_file":"a","key_file":"b"}],"ocsp":true}`:                                                                                       "unknown field",
+	}
+	for in, want := range cases {
+		_, err := Parse([]byte(pre + in + `}`))
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("tls %s\n  err = %v\n  want it to mention %q", in, err, want)
+		}
+	}
+	var many strings.Builder
+	many.WriteString(`{"certificates":[`)
+	for i := 0; i <= MaxCertificates; i++ {
+		if i > 0 {
+			many.WriteString(",")
+		}
+		many.WriteString(`{"cert_file":"a","key_file":"b"}`)
+	}
+	many.WriteString(`]}`)
+	if _, err := Parse([]byte(pre + many.String() + `}`)); err == nil || !strings.Contains(err.Error(), "at most 256 certificates") {
+		t.Errorf("too many certificates: %v", err)
+	}
+}
+
+func TestLoadResolvesCertificatePaths(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "steer.json")
+	js := `{"listen":":443","routes":[{"cluster":"a"}],"clusters":[{"name":"a","endpoints":[{"address":"h:1"}]}],
+		"tls":{"certificates":[{"cert_file":"certs/a.crt","key_file":"/abs/a.key"}]}}`
+	if err := os.WriteFile(path, []byte(js), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.TLS.Certificates[0]; got.CertFile != filepath.Join(dir, "certs", "a.crt") || got.KeyFile != "/abs/a.key" {
+		t.Fatalf("paths %+v", got)
+	}
 }
 
 // The shipped example configurations must always load.

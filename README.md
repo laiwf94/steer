@@ -116,6 +116,12 @@ Client-supplied `X-Forwarded-*` headers are dropped unless the peer is a
 configured trusted proxy, and request IDs are accepted when safe, generated
 otherwise, and passed both ways.
 
+With a `tls` block steer terminates TLS 1.2 and 1.3 on the proxy listener,
+choosing the certificate by SNI (exact names, then one-label wildcards, then
+the first certificate, or a refusal with `strict_sni`), with a cipher policy,
+a handshake timeout and a cap on concurrent handshakes. A reload re-reads the
+certificates; connections that are already open keep theirs.
+
 Configuration reloads on SIGHUP or `POST /reload`: the file is validated, a new
 runtime is built and swapped in atomically, and endpoints that keep their
 address keep their health and ejection state. A bad file is rejected and the
@@ -195,6 +201,8 @@ An upstream's own error response is passed through untouched.
 | `steer_health_transitions_total` | `cluster`, `to` |
 | `steer_overflow_total` | `cluster` |
 | `steer_no_route_total`, `steer_config_reloads_total{result}`, `steer_config_version` | |
+| `steer_tls_handshakes_total` | `result` (`ok`, `timeout`, `error`) |
+| `steer_tls_handshake_duration_seconds` (histogram), `steer_tls_handshakes_in_progress` | |
 
 ## Tests and benchmarks
 
@@ -255,6 +263,7 @@ internal/health      active health checks
 internal/outlier     outlier detection
 internal/retry       retry budget and backoff
 internal/proxy       request path, retries, forwarded headers, reload
+internal/tlsedge     TLS termination: SNI certificate selection, handshakes, reload
 internal/admin       admin API
 internal/fakeupstream  the upstream behind cmd/upstream and the tests
 internal/clock, reqid, metrics   time, request IDs, Prometheus exposition
