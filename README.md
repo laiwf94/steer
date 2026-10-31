@@ -1,5 +1,7 @@
 # steer
 
+> **This project has moved.** steer is now part of [laiwf94/edgefront](https://github.com/laiwf94/edgefront), where it lives under `legacy/steer/` with its full history while it is ported to Rust. This repository is archived.
+
 An HTTP load balancer and reverse proxy for the edge of a service. It keeps
 the success rate that clients see high while the servers behind it crash,
 return errors or stop answering.
